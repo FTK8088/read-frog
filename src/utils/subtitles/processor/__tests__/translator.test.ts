@@ -18,15 +18,10 @@ vi.mock("@/utils/prompts/subtitles", () => ({
   getSubtitlesTranslatePrompt: getSubtitlesTranslatePromptMock,
 }))
 
-/**
- * The enqueue calls only. Translating a fragment also asks the background for
- * the glossary that applies to this page, so `sendMessage` call 0 is no longer
- * the translation request.
- */
 function enqueueRequests() {
   return sendMessageMock.mock.calls
-    .filter((call) => call[0] === "enqueueSubtitlesTranslateRequest")
-    .map((call) => call[1])
+    .filter((call) => call[0] === "enqueueSubtitlesTranslateBatch")
+    .flatMap((call) => call[1].requests)
 }
 
 describe("subtitles translator", () => {
@@ -50,7 +45,51 @@ describe("subtitles translator", () => {
       systemPrompt: "system",
       prompt: "prompt",
     })
-    sendMessageMock.mockResolvedValue("translated subtitle")
+    sendMessageMock.mockImplementation(async (name, data) =>
+      name === "enqueueSubtitlesTranslateBatch"
+        ? data.requests.map(() => ({ translation: "translated subtitle" }))
+        : undefined,
+    )
+  })
+
+  it("submits ten prepared subtitles in one message, preserving their order", async () => {
+    const { translateSubtitles } = await import("../translator")
+    const fragments = Array.from({ length: 10 }, (_, index) => ({
+      text: `line ${index}`,
+      start: index * 1000,
+      end: (index + 1) * 1000,
+    }))
+    sendMessageMock.mockImplementation(async (name, data) =>
+      name === "enqueueSubtitlesTranslateBatch"
+        ? data.requests.map((request: { text: string }) => ({ translation: `t:${request.text}` }))
+        : undefined,
+    )
+
+    const translated = await translateSubtitles(fragments, {
+      videoTitle: "V",
+      subtitlesTextContent: "",
+    })
+    const groups = sendMessageMock.mock.calls.filter(
+      (call) => call[0] === "enqueueSubtitlesTranslateBatch",
+    )
+    expect(groups).toHaveLength(1)
+    expect(groups[0]![1].requests.map((request: { text: string }) => request.text)).toEqual(
+      fragments.map((f) => f.text),
+    )
+    expect(translated.map((f) => f.translation)).toEqual(fragments.map((f) => `t:${f.text}`))
+  })
+
+  it("keeps successful translations when a character-limited sub-batch fails", async () => {
+    const { translateSubtitles } = await import("../translator")
+    sendMessageMock.mockResolvedValue([{ translation: "译文" }, { error: "provider failed" }])
+    const translated = await translateSubtitles(
+      [
+        { text: "a", start: 0, end: 1000 },
+        { text: "b", start: 1000, end: 2000 },
+      ],
+      { videoTitle: "V", subtitlesTextContent: "" },
+    )
+    expect(translated.map((f) => f.translation)).toEqual(["译文", ""])
   })
 
   it("includes summary in subtitle requests and uses it in the cache hash", async () => {
@@ -233,10 +272,9 @@ describe("subtitles translator", () => {
       "getSubtitlesSummary",
       expect.objectContaining({ videoTitle: "Video title" }),
     )
-    expect(sendMessageMock).toHaveBeenCalledWith(
-      "enqueueSubtitlesTranslateRequest",
-      expect.objectContaining({ langConfig: configSnapshot.language }),
-    )
+    expect(sendMessageMock).toHaveBeenCalledWith("enqueueSubtitlesTranslateBatch", {
+      requests: [expect.objectContaining({ langConfig: configSnapshot.language })],
+    })
   })
 
   it("builds subtitle summary context hashes from subtitles text and provider config", async () => {

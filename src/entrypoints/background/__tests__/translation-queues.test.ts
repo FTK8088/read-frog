@@ -201,6 +201,7 @@ describe("translation queue helpers", () => {
       "getOrGenerateWebPageSummary",
       "cancelPageTranslationRequests",
       "enqueueSubtitlesTranslateRequest",
+      "enqueueSubtitlesTranslateBatch",
       "getSubtitlesSummary",
     ])
     resolveConfig(DEFAULT_CONFIG)
@@ -419,6 +420,202 @@ describe("translation queue helpers", () => {
 
     expect(executeTranslateMock).not.toHaveBeenCalled()
     expect(translationCachePutMock).not.toHaveBeenCalled()
+  })
+
+  describe("explicit subtitle batches", () => {
+    async function setupBatch(maxCharactersPerBatch = 1000) {
+      ensureInitializedConfigMock.mockResolvedValue({
+        ...DEFAULT_CONFIG,
+        videoSubtitles: {
+          ...DEFAULT_CONFIG.videoSubtitles,
+          requestQueueConfig: { rate: 100, capacity: 20 },
+          batchQueueConfig: { maxCharactersPerBatch, maxItemsPerBatch: 10 },
+        },
+      })
+      executeTranslateMock.mockImplementation(async (text: string) =>
+        text
+          .split(`\n\n${BATCH_SEPARATOR}\n\n`)
+          .map((line) => `t:${line}`)
+          .join(`\n\n${BATCH_SEPARATOR}\n\n`),
+      )
+      const { setupSubtitlesTranslationHandlers } = await import("../subtitles-translation")
+      setupSubtitlesTranslationHandlers()
+      return getRegisteredMessageHandler("enqueueSubtitlesTranslateBatch")
+    }
+
+    function requests(count: number, prefix = "line") {
+      return Array.from({ length: count }, (_, index) => ({
+        text: `${prefix}${index}`,
+        langConfig: DEFAULT_CONFIG.language,
+        providerRef: localProviderRef(llmProvider),
+        scheduleAt: Date.now(),
+        hash: `${prefix}-hash-${index}`,
+        webTitle: "Video",
+      }))
+    }
+
+    it("sends ten lines in one AI call", async () => {
+      const handler = await setupBatch()
+      const group = requests(10)
+      const result = await handler({ data: { requests: group } })
+      expect(result).toEqual(group.map((r) => ({ translation: `t:${r.text}` })))
+      expect(executeTranslateMock).toHaveBeenCalledTimes(1)
+      expect(executeTranslateMock.mock.calls[0]![0]).toBe(
+        group.map((r) => r.text).join(`\n\n${BATCH_SEPARATOR}\n\n`),
+      )
+      expect(executeTranslateMock.mock.calls[0]![4]).toMatchObject({ batchSize: 10 })
+      expect(translationCachePutMock).toHaveBeenCalledTimes(10)
+    })
+
+    it("waits for all cache lookups before sending the uncached lines together", async () => {
+      const handler = await setupBatch()
+      let releaseLookup!: (value: undefined) => void
+      translationCacheGetMock.mockImplementation(async (hash: string) => {
+        if (hash === "line-hash-0") return { translation: "cached zero" }
+        if (hash === "line-hash-1")
+          return new Promise((resolve) => {
+            releaseLookup = resolve
+          })
+        return undefined
+      })
+      const group = requests(10)
+      const pending = handler({ data: { requests: group } })
+      await vi.waitFor(() => expect(releaseLookup).toBeTypeOf("function"))
+      // More than the old collection delay elapses while one lookup is held.
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      expect(executeTranslateMock).not.toHaveBeenCalled()
+      releaseLookup(undefined)
+      await expect(pending).resolves.toEqual([
+        { translation: "cached zero" },
+        ...group.slice(1).map((r) => ({ translation: `t:${r.text}` })),
+      ])
+      expect(executeTranslateMock).toHaveBeenCalledTimes(1)
+      expect(executeTranslateMock.mock.calls[0]![0]).not.toContain("line0")
+      expect(executeTranslateMock.mock.calls[0]![4]).toMatchObject({ batchSize: 9 })
+      expect(translationCachePutMock).toHaveBeenCalledTimes(9)
+    })
+
+    it("avoids every AI call when the whole group is cached", async () => {
+      const handler = await setupBatch()
+      translationCacheGetMock.mockImplementation(async (hash: string) => ({ translation: hash }))
+      const group = requests(10)
+      await expect(handler({ data: { requests: group } })).resolves.toEqual(
+        group.map((r) => ({ translation: r.hash })),
+      )
+      expect(executeTranslateMock).not.toHaveBeenCalled()
+    })
+
+    it("sends the trailing partial group immediately", async () => {
+      const handler = await setupBatch()
+      const group = requests(3)
+      await expect(handler({ data: { requests: group } })).resolves.toEqual(
+        group.map((r) => ({ translation: `t:${r.text}` })),
+      )
+      expect(executeTranslateMock).toHaveBeenCalledTimes(1)
+      expect(executeTranslateMock.mock.calls[0]![4]).toMatchObject({ batchSize: 3 })
+    })
+
+    it("splits a group at the character limit while preserving result order", async () => {
+      const handler = await setupBatch(10)
+      const group = requests(5) // Each line is 5 characters, so 2 + 2 + 1.
+      await expect(handler({ data: { requests: group } })).resolves.toEqual(
+        group.map((r) => ({ translation: `t:${r.text}` })),
+      )
+      expect(executeTranslateMock.mock.calls.map((call) => call[0])).toEqual([
+        `line0\n\n${BATCH_SEPARATOR}\n\nline1`,
+        `line2\n\n${BATCH_SEPARATOR}\n\nline3`,
+        "line4",
+      ])
+      expect(executeTranslateMock.mock.calls.map((call) => call[4].batchSize)).toEqual([2, 2, 1])
+    })
+
+    it("uses the uncached batch size in hosted subtitle instructions", async () => {
+      const handler = await setupBatch()
+      const group = requests(3).map((request) => ({
+        ...request,
+        providerRef: {
+          kind: "system" as const,
+          providerId: "read-frog-advance-ai",
+          modelTier: "advance" as const,
+          modelRevision: "advance-r1",
+        },
+      }))
+      translationCacheGetMock.mockImplementation(async (hash: string) =>
+        hash === "line-hash-0" ? { translation: "cached zero" } : undefined,
+      )
+      runStreamTextInBackgroundMock.mockResolvedValue({
+        output: `t:line1\n\n${BATCH_SEPARATOR}\n\nt:line2`,
+      })
+
+      await expect(handler({ data: { requests: group } })).resolves.toEqual([
+        { translation: "cached zero" },
+        { translation: "t:line1" },
+        { translation: "t:line2" },
+      ])
+
+      expect(executeTranslateMock).not.toHaveBeenCalled()
+      expect(runStreamTextInBackgroundMock).toHaveBeenCalledTimes(1)
+      expect(runStreamTextInBackgroundMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hostedFeature: "videoSubtitles",
+          instructions: expect.stringContaining(
+            "Return exactly 2 translated segments and exactly 1 standalone %% separator lines",
+          ),
+        }),
+        expect.anything(),
+      )
+    })
+
+    it("keeps simultaneous groups separate even when neither fills the configured size", async () => {
+      const handler = await setupBatch()
+      await Promise.all([
+        handler({ data: { requests: requests(3, "first") } }),
+        handler({ data: { requests: requests(3, "second") } }),
+      ])
+      expect(executeTranslateMock).toHaveBeenCalledTimes(2)
+      const payloads = executeTranslateMock.mock.calls.map((call) => call[0] as string)
+      expect(
+        payloads.filter((text) => text.includes("first") && text.includes("second")),
+      ).toHaveLength(0)
+    })
+
+    it("retries a mismatched AI group without falling back to single-line calls", async () => {
+      const handler = await setupBatch()
+      vi.useFakeTimers()
+      try {
+        executeTranslateMock.mockResolvedValue("wrong result count")
+        const pending = handler({ data: { requests: requests(3) } })
+        await vi.advanceTimersByTimeAsync(8000)
+        const result = (await pending) as Array<{ error: string }>
+        expect(result).toHaveLength(3)
+        expect(result.every((item) => item.error.includes("Batch result count mismatch"))).toBe(
+          true,
+        )
+        expect(executeTranslateMock).toHaveBeenCalledTimes(4)
+        expect(executeTranslateMock.mock.calls.map((call) => call[4].batchSize)).toEqual([
+          3, 3, 3, 3,
+        ])
+        expect(
+          executeTranslateMock.mock.calls.every(([text]) =>
+            (text as string).includes(BATCH_SEPARATOR),
+          ),
+        ).toBe(true)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it("keeps non-AI translation requests individual", async () => {
+      const handler = await setupBatch()
+      const group = requests(3).map((request) => ({
+        ...request,
+        providerRef: localProviderRef(googleProvider),
+      }))
+      await expect(handler({ data: { requests: group } })).resolves.toEqual(
+        group.map((r) => ({ translation: `t:${r.text}` })),
+      )
+      expect(executeTranslateMock).toHaveBeenCalledTimes(3)
+    })
   })
 
   it("passes subtitle summary through the translation queue without generating a new summary", async () => {

@@ -2,6 +2,7 @@ import type { Config } from "@/types/config/config"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { DEFAULT_CONFIG } from "@/utils/constants/config"
 import {
+  BATCH_SEPARATOR,
   DEFAULT_BATCH_TRANSLATE_PROMPT,
   DEFAULT_SENTINEL_TRANSLATE_PROMPT,
   DEFAULT_TRANSLATE_PROMPT_ID,
@@ -342,6 +343,105 @@ describe("translate prompt tokens", () => {
     expect(result.systemPrompt).toContain("Video title: No title available")
     expect(result.systemPrompt).toContain("Video summary: No summary available")
     expect(result.systemPrompt).not.toContain("Video description:")
+  })
+})
+
+describe("subtitle batch alignment", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    mockGetLocalConfig = vi.mocked((await import("@/utils/config/storage")).getLocalConfig)
+    mockGetLocalConfig.mockResolvedValue(DEFAULT_CONFIG)
+  })
+
+  it.each([1, 2, 10, 16])("requires exactly %i translated subtitle segments", async (batchSize) => {
+    const input = Array.from(
+      { length: batchSize },
+      (_, index) => `Subtitle ${index + 1}. Another sentence.\nA line mentioning %% inline.`,
+    ).join(`\n\n${BATCH_SEPARATOR}\n\n`)
+
+    const result = await getSubtitlesTranslatePrompt("Chinese", input, {
+      isBatch: true,
+      batchSize,
+    })
+
+    expect(result.systemPrompt).toContain(
+      `This request contains exactly ${batchSize} subtitle items`,
+    )
+    expect(result.systemPrompt).toContain(
+      `Return exactly ${batchSize} translated segments and exactly ${batchSize - 1} standalone %% separator lines`,
+    )
+    expect(result.systemPrompt).toContain("even if it contains multiple sentences or line breaks")
+    expect(result.systemPrompt).toContain("Never split, merge, omit, duplicate, or add subtitles")
+    expect(result.systemPrompt).toContain("never at the beginning or end")
+    expect(result.prompt).toContain(input)
+  })
+
+  it("appends alignment rules after a selected custom subtitle prompt", async () => {
+    const customSystemPrompt = "My translation style. Combine the text into a single paragraph."
+    mockGetLocalConfig.mockResolvedValue({
+      ...DEFAULT_CONFIG,
+      videoSubtitles: {
+        ...DEFAULT_CONFIG.videoSubtitles,
+        customPromptsConfig: {
+          promptId: "custom-subtitles",
+          patterns: [
+            {
+              id: "custom-subtitles",
+              name: "Custom subtitles",
+              systemPrompt: customSystemPrompt,
+              prompt: "Custom input: {{input}}",
+            },
+          ],
+        },
+      },
+    })
+    const input = `Hello\n\n${BATCH_SEPARATOR}\n\nWorld`
+
+    const result = await getSubtitlesTranslatePrompt("Chinese", input, {
+      isBatch: true,
+      batchSize: 2,
+    })
+
+    expect(result.systemPrompt).toContain(customSystemPrompt)
+    expect(result.systemPrompt.indexOf("## Subtitle Alignment Rules")).toBeGreaterThan(
+      result.systemPrompt.indexOf(customSystemPrompt),
+    )
+    expect(result.systemPrompt).toContain("override any conflicting formatting instructions above")
+    expect(result.systemPrompt).toContain("This request contains exactly 2 subtitle items")
+    expect(result.prompt).toBe(`Custom input: ${input}`)
+  })
+
+  it("keeps per-subtitle cache prompts independent of the eventual batch size", async () => {
+    const result = await getSubtitlesTranslatePrompt("Chinese", "Hello", { isBatch: true })
+
+    expect(result.systemPrompt).toContain("## Subtitle Alignment Rules")
+    expect(result.systemPrompt).not.toContain("This request contains exactly")
+  })
+
+  it("leaves non-batch subtitle prompts unchanged", async () => {
+    const result = await getSubtitlesTranslatePrompt("Chinese", "Hello", { batchSize: 1 })
+
+    expect(result.systemPrompt).not.toContain("## Subtitle Alignment Rules")
+    expect(result.systemPrompt).not.toContain("This request contains exactly")
+  })
+
+  it("does not change webpage prompts when batch size metadata is present", () => {
+    const input = `Hello\n\n${BATCH_SEPARATOR}\n\nWorld`
+    const withoutSize = getTranslatePromptFromConfig(
+      defaultTranslatePromptConfig,
+      "Chinese",
+      input,
+      {
+        isBatch: true,
+      },
+    )
+    const withSize = getTranslatePromptFromConfig(defaultTranslatePromptConfig, "Chinese", input, {
+      isBatch: true,
+      batchSize: 2,
+    })
+
+    expect(withSize).toEqual(withoutSize)
+    expect(withSize.systemPrompt).not.toContain("## Subtitle Alignment Rules")
   })
 })
 

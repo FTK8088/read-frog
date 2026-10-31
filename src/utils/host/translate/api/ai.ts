@@ -24,6 +24,7 @@ export async function aiTranslate<TContext>(
   promptResolver: PromptResolver<TContext>,
   options?: {
     isBatch?: boolean
+    batchSize?: number
     context?: TContext
     signal?: AbortSignal
     // Forwarded verbatim to the prompt resolver: the terms were resolved by the

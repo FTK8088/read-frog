@@ -75,6 +75,7 @@ async function executeQueuedTranslation<TContext>(
   promptResolver: PromptResolver<TContext>,
   options: {
     isBatch?: boolean
+    batchSize?: number
     context?: TContext
     textFormat?: import("@/types/config/translate").TranslationTextFormat
     preserveLineBreaks?: boolean
@@ -96,6 +97,7 @@ async function executeQueuedTranslation<TContext>(
   const targetLangName = LANG_CODE_TO_EN_NAME[langConfig.targetCode]
   const { systemPrompt, prompt } = await promptResolver(targetLangName, text, {
     isBatch: options.isBatch,
+    batchSize: options.batchSize,
     context: options.context,
     glossaryTerms: options.glossaryTerms,
   })
@@ -233,6 +235,7 @@ export async function executeBatchTranslation<TContext>(
     promptResolver,
     {
       isBatch: true,
+      batchSize: dataList.length,
       context,
       signal,
       hostedRequestId,
@@ -314,7 +317,7 @@ async function createTranslationQueues<TContext>(config: TranslationQueueSetupCo
     maxItemsPerBatch,
     batchDelay: 100,
     maxRetries: 3,
-    enableFallbackToIndividual: true,
+    enableFallbackToIndividual: queueName !== "subtitles",
     // Narrow port, not the whole queue: while the rate limiter has no free
     // slot, pending batches keep filling to maxItems/maxChars instead of
     // flushing tiny every batchDelay (they'd only freeze in the queue).

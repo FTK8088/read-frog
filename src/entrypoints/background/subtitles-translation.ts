@@ -1,4 +1,5 @@
 import type { SubtitlePromptContext } from "@/types/content"
+import type { SubtitleTranslationRequest, SubtitleTranslationResult } from "@/utils/message"
 import { cleanText } from "@/utils/content/utils"
 import { db } from "@/utils/db/dexie/db"
 import { Sha256Hex } from "@/utils/hash"
@@ -18,77 +19,92 @@ import {
 export function setupSubtitlesTranslationHandlers(): void {
   const queuesPromise = createSubtitlesTranslationQueues()
 
-  onMessage("enqueueSubtitlesTranslateRequest", async (message) => {
+  async function translateRequests(requests: SubtitleTranslationRequest[], immediate: boolean) {
     const { requestQueue, batchQueue } = await queuesPromise
-    const {
-      data: {
-        text,
-        langConfig,
-        providerRef,
-        scheduleAt,
-        hash,
-        webTitle,
-        webDescription,
-        summary,
-        glossaryTerms,
-        glossaryRevision,
-      },
-    } = message
-
-    if (hash) {
-      const cached = await db.translationCache.get(hash)
-      if (cached) {
-        return cached.translation
+    // Complete every lookup before admitting any item: a slow cache read must
+    // not let the 100ms collector split a group that was selected together.
+    const cached = await Promise.all(
+      requests.map(async (request) =>
+        request.hash ? db.translationCache.get(request.hash) : undefined,
+      ),
+    )
+    const batchData = requests.flatMap((request, index) => {
+      if (cached[index] || !shouldUseBatchQueue(request.providerRef)) return []
+      const context: SubtitlePromptContext = {
+        webTitle: normalizePromptContextValue(request.webTitle),
+        webDescription: normalizePromptContextValue(request.webDescription),
+        videoSummary: normalizePromptContextValue(request.summary),
       }
-    }
+      return [
+        {
+          text: request.text,
+          langConfig: request.langConfig,
+          provider: request.providerRef,
+          hostedFeature: "videoSubtitles" as const,
+          hash: request.hash,
+          scheduleAt: request.scheduleAt,
+          context,
+          glossaryTerms: request.glossaryTerms,
+          glossaryRevision: request.glossaryRevision,
+        },
+      ]
+    })
+    const batchPromises = immediate
+      ? batchQueue.enqueueBatch(batchData)
+      : batchData.map((data) => batchQueue.enqueue(data))
+    let batchIndex = 0
+    return Promise.allSettled(
+      requests.map(async (request, index) => {
+        const hit = cached[index]
+        if (hit) return hit.translation
 
-    let result: string
-    const context: SubtitlePromptContext = {
-      webTitle: normalizePromptContextValue(webTitle),
-      webDescription: normalizePromptContextValue(webDescription),
-      videoSummary: normalizePromptContextValue(summary),
-    }
+        let translation: string
+        if (shouldUseBatchQueue(request.providerRef)) {
+          translation = await batchPromises[batchIndex++]!
+        } else {
+          const localConfig = getLocalProviderConfig(request.providerRef)
+          if (!localConfig) {
+            throw new Error("Built-in AI subtitle translation must use the batch queue")
+          }
+          const thunk = (signal?: AbortSignal) =>
+            executeTranslate(
+              request.text,
+              request.langConfig,
+              localConfig,
+              getSubtitlesTranslatePrompt,
+              {
+                signal,
+                glossaryTerms: request.glossaryTerms,
+              },
+            )
+          translation = await requestQueue.enqueue(thunk, request.scheduleAt, request.hash)
+        }
+        if (translation && request.hash) {
+          await db.translationCache.put({
+            key: request.hash,
+            translation,
+            createdAt: new Date(),
+          })
+        }
+        return translation
+      }),
+    )
+  }
 
-    if (shouldUseBatchQueue(providerRef)) {
-      const data = {
-        text,
-        langConfig,
-        provider: providerRef,
-        hostedFeature: "videoSubtitles" as const,
-        hash,
-        scheduleAt,
-        context,
-        // Kept off `context`, which is part of the batch key — see
-        // `mergeBatchGlossaryTerms`.
-        glossaryTerms,
-        glossaryRevision,
-      }
-      result = await batchQueue.enqueue(data)
-    } else {
-      // Unreachable for system refs — shouldUseBatchQueue always batches them —
-      // but it must fail loudly rather than silently mistranslate if that ever
-      // changes, since executeTranslate only understands a local config.
-      const localConfig = getLocalProviderConfig(providerRef)
-      if (!localConfig) {
-        throw new Error("Built-in AI subtitle translation must use the batch queue")
-      }
-      const thunk = (signal?: AbortSignal) =>
-        executeTranslate(text, langConfig, localConfig, getSubtitlesTranslatePrompt, {
-          signal,
-          glossaryTerms,
-        })
-      result = await requestQueue.enqueue(thunk, scheduleAt, hash)
-    }
+  // Keep the single-item protocol for content scripts already open across an update.
+  onMessage("enqueueSubtitlesTranslateRequest", async ({ data }) => {
+    const [result] = await translateRequests([data], false)
+    if (result!.status === "rejected") throw result!.reason
+    return result!.value
+  })
 
-    if (result && hash) {
-      await db.translationCache.put({
-        key: hash,
-        translation: result,
-        createdAt: new Date(),
-      })
-    }
-
-    return result
+  onMessage("enqueueSubtitlesTranslateBatch", async ({ data }) => {
+    const results = await translateRequests(data.requests, true)
+    return results.map((result): SubtitleTranslationResult =>
+      result.status === "fulfilled"
+        ? { translation: result.value }
+        : { error: result.reason instanceof Error ? result.reason.message : String(result.reason) },
+    )
   })
 
   onMessage("getSubtitlesSummary", async (message) => {

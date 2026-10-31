@@ -20,6 +20,7 @@ export async function executeTranslate<TContext>(
   promptResolver: PromptResolver<TContext>,
   options?: {
     isBatch?: boolean
+    batchSize?: number
     context?: TContext
     textFormat?: TranslationTextFormat
     // Only Google needs protection: its translateHtml transport collapses

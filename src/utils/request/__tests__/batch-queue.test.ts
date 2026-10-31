@@ -1046,3 +1046,47 @@ describe("batchQueue – dispatch gate", () => {
     await expect(p2).rejects.toMatchObject({ name: "TranslationCancelledError" })
   })
 })
+
+describe("batchQueue – explicit groups", () => {
+  it("flushes a partial group immediately without merging it with timed arrivals", async () => {
+    vi.useFakeTimers()
+    const executeBatch = vi.fn<(items: string[]) => Promise<string[]>>(async (items) => items)
+    const q = new BatchQueue<string, string>({
+      maxCharactersPerBatch: 100,
+      maxItemsPerBatch: 10,
+      batchDelay: 100,
+      getBatchKey: () => "same",
+      getCharacters: (text) => text.length,
+      executeBatch,
+    })
+    const timed = q.enqueue("timed")
+    const group = q.enqueueBatch(["first", "second"])
+    expect(executeBatch.mock.calls.map(([items]) => items)).toEqual([["first", "second"]])
+    await expect(Promise.all(group)).resolves.toEqual(["first", "second"])
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(timed).resolves.toBe("timed")
+    expect(executeBatch.mock.calls.map(([items]) => items)).toEqual([
+      ["first", "second"],
+      ["timed"],
+    ])
+  })
+
+  it("enforces both item and character limits for explicit groups", async () => {
+    const executeBatch = vi.fn<(items: string[]) => Promise<string[]>>(async (items) => items)
+    const q = new BatchQueue<string, string>({
+      maxCharactersPerBatch: 6,
+      maxItemsPerBatch: 2,
+      batchDelay: 100,
+      getBatchKey: () => "same",
+      getCharacters: (text) => text.length,
+      executeBatch,
+    })
+    const group = ["a", "b", "cccc", "dddd", "e"]
+    await expect(Promise.all(q.enqueueBatch(group))).resolves.toEqual(group)
+    expect(executeBatch.mock.calls.map(([items]) => items)).toEqual([
+      ["a", "b"],
+      ["cccc"],
+      ["dddd", "e"],
+    ])
+  })
+})

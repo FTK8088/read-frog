@@ -26,6 +26,22 @@ import type { PromptableProviderRef, SerializableProviderRef } from "@/utils/pro
 import type { EdgeTTSVoice } from "@/utils/server/edge-tts/types"
 import { defineExtensionMessaging } from "@webext-core/messaging"
 
+export interface SubtitleTranslationRequest {
+  text: string
+  langConfig: Config["language"]
+  providerRef: SerializableProviderRef
+  scheduleAt: number
+  hash: string
+  webTitle?: string | null
+  webDescription?: string | null
+  summary?: string | null
+  glossaryTerms?: MatchedTerm[]
+  glossaryRevision?: number
+}
+
+// Errors must be plain data when crossing the extension message boundary.
+export type SubtitleTranslationResult = { translation: string } | { error: string }
+
 interface ProtocolMap {
   // navigation
   openPage: (data: { url: string; active?: boolean }) => void
@@ -143,19 +159,10 @@ interface ProtocolMap {
       webContent: string
     },
   ) => Promise<string | null>
-  enqueueSubtitlesTranslateRequest: (data: {
-    text: string
-    langConfig: Config["language"]
-    providerRef: SerializableProviderRef
-    scheduleAt: number
-    hash: string
-    webTitle?: string | null
-    webDescription?: string | null
-    summary?: string | null
-    // See `enqueueTranslateRequest`.
-    glossaryTerms?: MatchedTerm[]
-    glossaryRevision?: number
-  }) => Promise<string>
+  enqueueSubtitlesTranslateRequest: (data: SubtitleTranslationRequest) => Promise<string>
+  enqueueSubtitlesTranslateBatch: (data: {
+    requests: SubtitleTranslationRequest[]
+  }) => Promise<SubtitleTranslationResult[]>
   getSubtitlesSummary: (data: {
     videoTitle: string
     subtitlesContext: string

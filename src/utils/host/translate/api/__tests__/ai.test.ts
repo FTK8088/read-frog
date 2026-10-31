@@ -1,5 +1,6 @@
 import type { LLMProviderConfig } from "@/types/config/provider"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { getSubtitlesTranslatePrompt } from "@/utils/prompts/subtitles"
 import { getRequestErrorMeta } from "@/utils/request/retry-policy"
 import { aiTranslate } from "../ai"
 
@@ -46,6 +47,28 @@ describe("aiTranslate", () => {
     mocks.getModelById.mockResolvedValue("model")
     mocks.resolveModelId.mockReturnValue("gpt-5-mini")
     mocks.getProviderOptionsWithOverride.mockReturnValue({})
+  })
+
+  it("sends the actual subtitle count in the model instructions", async () => {
+    const input = Array.from({ length: 16 }, (_, index) => `Subtitle ${index + 1}`).join(
+      "\n\n%%\n\n",
+    )
+    mocks.generateText.mockResolvedValueOnce({ text: "translated subtitles" })
+
+    await aiTranslate(input, "Chinese", providerConfig, getSubtitlesTranslatePrompt, {
+      isBatch: true,
+      batchSize: 16,
+      glossaryTerms: [],
+    })
+
+    expect(mocks.generateText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instructions: expect.stringContaining(
+          "Return exactly 16 translated segments and exactly 15 standalone %% separator lines",
+        ),
+        prompt: expect.stringContaining(input),
+      }),
+    )
   })
 
   it("preserves AI SDK error metadata for retry policy decisions", async () => {

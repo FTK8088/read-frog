@@ -5,6 +5,7 @@ import { resolveGlossaryTerms } from "@/utils/glossary/active-matcher"
 import { appendGlossaryToSystemPrompt } from "@/utils/glossary/prompt"
 import { DEFAULT_CONFIG } from "../constants/config"
 import {
+  BATCH_SEPARATOR,
   BUILT_IN_SUBTITLE_TRANSLATE_PROMPTS,
   DEFAULT_BATCH_TRANSLATE_PROMPT,
   DEFAULT_TRANSLATE_PROMPT_ID,
@@ -16,6 +17,12 @@ import {
   VIDEO_SUMMARY,
 } from "../constants/prompt"
 import { resolvePromptReplacementValue } from "./translate"
+
+const SUBTITLE_BATCH_ALIGNMENT_PROMPT = `## Subtitle Alignment Rules
+These rules override any conflicting formatting instructions above:
+- Translate each input subtitle into exactly one non-empty output segment in the original order, even if it contains multiple sentences or line breaks.
+- Never split, merge, omit, duplicate, or add subtitles. Output only translations, without explanations or numbering.
+- Put standalone ${BATCH_SEPARATOR} separator lines only between translations, never at the beginning or end. Do not output empty segments.`
 
 export async function getSubtitlesTranslatePrompt(
   targetLang: string,
@@ -44,7 +51,16 @@ export async function getSubtitlesTranslatePrompt(
   if (options?.isBatch) {
     systemPrompt = `${systemPrompt}
 
-${DEFAULT_BATCH_TRANSLATE_PROMPT}`
+${DEFAULT_BATCH_TRANSLATE_PROMPT}
+
+${SUBTITLE_BATCH_ALIGNMENT_PROMPT}`
+
+    // Cache keys are built per subtitle before the final batch is known, so
+    // keep the alignment rules there but add the count only at dispatch time.
+    if (options.batchSize !== undefined) {
+      systemPrompt += `
+- This request contains exactly ${options.batchSize} subtitle items. Return exactly ${options.batchSize} translated segments and exactly ${options.batchSize - 1} standalone ${BATCH_SEPARATOR} separator lines.`
+    }
   }
 
   // Build title and summary replacement values

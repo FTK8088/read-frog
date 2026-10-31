@@ -3,6 +3,7 @@ import type { HostedAiTextStreamRoute } from "@/types/background-stream"
 import type { Config } from "@/types/config/config"
 import type { SubtitlePromptContext } from "@/types/content"
 import type { MatchedTerm } from "@/utils/glossary/types"
+import type { SubtitleTranslationRequest } from "@/utils/message"
 import type { PromptableProviderRef, SerializableProviderRef } from "@/utils/providers/provider-ref"
 import { LANG_CODE_TO_EN_NAME } from "@read-frog/definitions"
 import { APICallError } from "ai"
@@ -30,7 +31,7 @@ import { resolveProviderRefForCapability } from "@/utils/providers/provider-regi
 
 /**
  * One toast for the whole run, not one per batch: the provider is re-resolved
- * per ≤5-cue batch, and every batch of a video hits the same verdict.
+ * per cue batch, and every batch of a video hits the same verdict.
  */
 const SUBTITLES_HOSTED_UNAVAILABLE_TOAST_ID = "subtitles-hosted-unavailable"
 
@@ -171,14 +172,14 @@ async function buildSubtitleHashComponents(
   return hashComponents
 }
 
-async function translateSingleSubtitle(
+async function prepareSubtitleRequest(
   text: string,
   langConfig: Config["language"],
   providerRef: SerializableProviderRef,
   enableAIContentAware: boolean,
   glossaryEnabled: boolean,
   videoContext: SubtitlesVideoContext,
-): Promise<string> {
+): Promise<SubtitleTranslationRequest> {
   const subtitlePromptContext = normalizeSubtitlePromptContext(videoContext)
   // Resolved once on the page, where the URL says which glossaries apply, and
   // then carried by the request — the background serves every tab at once.
@@ -208,7 +209,7 @@ async function translateSingleSubtitle(
     hashComponents.push(summary ? "subtitleSummary=ready" : "subtitleSummary=missing")
   }
 
-  return await sendMessage("enqueueSubtitlesTranslateRequest", {
+  return {
     text,
     langConfig,
     providerRef,
@@ -219,7 +220,7 @@ async function translateSingleSubtitle(
     summary: enableAIContentAware ? subtitlePromptContext.videoSummary : undefined,
     glossaryTerms,
     glossaryRevision,
-  })
+  }
 }
 
 export type SubtitlesProviderResolution<
@@ -366,18 +367,37 @@ export async function translateSubtitles(
   const langConfig = config.language
   const enableAIContentAware = config.pageTranslation.enableAIContentAware
 
-  const translationPromises = fragments.map((fragment) =>
-    translateSingleSubtitle(
-      fragment.text,
-      langConfig,
-      providerRef,
-      enableAIContentAware,
-      config.glossary.enabled,
-      videoContext,
+  const prepared = await Promise.allSettled(
+    fragments.map((fragment) =>
+      prepareSubtitleRequest(
+        fragment.text,
+        langConfig,
+        providerRef,
+        enableAIContentAware,
+        config.glossary.enabled,
+        videoContext,
+      ),
     ),
   )
-
-  const results = await Promise.allSettled(translationPromises)
+  const requests = prepared.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : [],
+  )
+  const batchResults =
+    requests.length > 0
+      ? await sendMessage("enqueueSubtitlesTranslateBatch", { requests }).catch(
+          (error: unknown) => {
+            throw new Error(toFriendlyErrorMessage(error))
+          },
+        )
+      : []
+  let requestIndex = 0
+  const results: PromiseSettledResult<string>[] = prepared.map((result) => {
+    if (result.status === "rejected") return result
+    const translated = batchResults[requestIndex++]!
+    return "translation" in translated
+      ? { status: "fulfilled", value: translated.translation }
+      : { status: "rejected", reason: new Error(translated.error) }
+  })
 
   // If all translations failed, throw with friendly error message
   const allRejected = results.every((r): r is PromiseRejectedResult => r.status === "rejected")

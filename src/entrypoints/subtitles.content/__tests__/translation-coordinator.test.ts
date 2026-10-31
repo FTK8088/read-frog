@@ -1,5 +1,17 @@
-import { describe, expect, it, vi } from "vitest"
+import type { Config } from "@/types/config/config"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { getLocalConfig } from "@/utils/config/storage"
+import { DEFAULT_CONFIG } from "@/utils/constants/config"
 import { TranslationCoordinator } from "../translation-coordinator"
+
+vi.mock("@/utils/config/storage", () => ({
+  getLocalConfig: vi.fn<() => Promise<Config | null>>(async () => null),
+}))
+
+beforeEach(() => {
+  vi.mocked(getLocalConfig).mockResolvedValue(null)
+})
+afterEach(() => vi.restoreAllMocks())
 
 describe("translation coordinator loading state", () => {
   it("sets loading for the active untranslated cue", () => {
@@ -97,8 +109,7 @@ describe("translation coordinator loading state", () => {
     })
 
     coordinator.start()
-    await Promise.resolve()
-    expect(spy).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
 
     coordinator.stop()
     const firstCall = spy.mock.calls[0]!
@@ -175,14 +186,12 @@ describe("translation coordinator loading state", () => {
     })
 
     coordinator.start()
-    await Promise.resolve()
-    expect(spy).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
 
     coordinator.stop()
     coordinator.start()
-    await Promise.resolve()
     // Resume must be able to start a new batch (isTranslating not stuck).
-    expect(spy).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(2))
 
     // Stale first-run result.
     resolvers[0]!([{ text: "a", start: 0, end: 1000, translation: "STALE" }])
@@ -194,7 +203,11 @@ describe("translation coordinator loading state", () => {
     resolvers[1]!([{ text: "a", start: 0, end: 1000, translation: "FRESH" }])
     await Promise.resolve()
     await Promise.resolve()
-    expect(onTranslated).toHaveBeenCalledWith([expect.objectContaining({ translation: "FRESH" })])
+    await vi.waitFor(() =>
+      expect(onTranslated).toHaveBeenCalledWith([
+        expect.objectContaining({ translation: "FRESH" }),
+      ]),
+    )
 
     spy.mockRestore()
   })
@@ -227,7 +240,7 @@ describe("translation coordinator loading state", () => {
       })
 
       coordinator.start()
-      await Promise.resolve()
+      await vi.waitFor(() => expect(spy).toHaveBeenCalled())
       coordinator.stop()
 
       const batch = (spy.mock.calls[0]?.[0] ?? []) as Array<{ start: number }>
@@ -250,13 +263,21 @@ describe("translation coordinator loading state", () => {
     const onStateChange = vi.fn<(...args: any[]) => any>()
 
     const translator = await import("@/utils/subtitles/processor/translator")
-    const spy = vi
-      .spyOn(translator, "translateSubtitles")
-      .mockRejectedValue(new Error("translate failed"))
+    let rejectTranslate!: (error: Error) => void
+    const spy = vi.spyOn(translator, "translateSubtitles").mockImplementation(
+      () =>
+        new Promise((_, reject) => {
+          rejectTranslate = reject
+        }),
+    )
 
     const config = await import("@/utils/config/storage")
     const configSpy = vi.spyOn(config, "getLocalConfig").mockResolvedValue({
-      videoSubtitles: { style: { displayMode: "bilingual" } },
+      ...DEFAULT_CONFIG,
+      videoSubtitles: {
+        ...DEFAULT_CONFIG.videoSubtitles,
+        style: { ...DEFAULT_CONFIG.videoSubtitles.style, displayMode: "bilingual" },
+      },
     } as any)
 
     const coordinator = new TranslationCoordinator({
@@ -274,13 +295,14 @@ describe("translation coordinator loading state", () => {
     })
 
     coordinator.start()
-    await Promise.resolve()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalled())
     // Recut mid-request: original cue is gone; only identity-valid fallbacks may publish.
     fragments = [
       { text: "hello", start: 0, end: 1000 },
       { text: "world", start: 1000, end: 2000 },
       { text: "next", start: 2000, end: 3000 },
     ]
+    rejectTranslate(new Error("translate failed"))
     await vi.waitFor(() => {
       expect(onStateChange).toHaveBeenCalledWith("error", { message: "translate failed" })
     })
@@ -293,5 +315,114 @@ describe("translation coordinator loading state", () => {
 
     spy.mockRestore()
     configSpy.mockRestore()
+  })
+})
+
+describe("configured AI subtitle groups", () => {
+  function configWithBatchSize(size: number) {
+    return {
+      ...DEFAULT_CONFIG,
+      videoSubtitles: {
+        ...DEFAULT_CONFIG.videoSubtitles,
+        providerId: "openai-default",
+        batchQueueConfig: { maxCharactersPerBatch: 1000, maxItemsPerBatch: size },
+      },
+    }
+  }
+
+  async function createSession(count = 23) {
+    const translator = await import("@/utils/subtitles/processor/translator")
+    const spy = vi
+      .spyOn(translator, "translateSubtitles")
+      .mockImplementation(async (fragments) =>
+        fragments.map((f) => ({ ...f, translation: `t:${f.text}` })),
+      )
+    const fragments = Array.from({ length: count }, (_, index) => ({
+      text: `line ${index}`,
+      start: index * 10_000,
+      end: index * 10_000 + 5000,
+    }))
+    const video = {
+      currentTime: 0,
+      playbackRate: 1,
+      addEventListener: vi.fn<(...args: any[]) => any>(),
+      removeEventListener: vi.fn<(...args: any[]) => any>(),
+    } as unknown as HTMLVideoElement
+    const coordinator = new TranslationCoordinator({
+      getFragments: () => fragments,
+      getVideoElement: () => video,
+      getCurrentState: () => "idle",
+      segmentationPipeline: null,
+      onTranslated: vi.fn<(...args: any[]) => any>(),
+      onStateChange: vi.fn<(...args: any[]) => any>(),
+    })
+    return { coordinator, spy, video }
+  }
+
+  it("selects ten lines beyond the window and waits until the next group is near", async () => {
+    vi.mocked(getLocalConfig).mockResolvedValue(configWithBatchSize(10))
+    const { coordinator, spy, video } = await createSession()
+    coordinator.start()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+    expect(spy.mock.calls[0]![0]).toHaveLength(10)
+    expect(spy.mock.calls[0]![0].at(-1)!.start).toBe(90_000)
+
+    video.currentTime = 69
+    coordinator.requestTick()
+    // Wait for the config read and the no-work pass, not just a single microtask.
+    await vi.waitFor(() => expect((coordinator as any).isTranslating).toBe(false))
+    expect(spy).toHaveBeenCalledTimes(1)
+    video.currentTime = 70
+    coordinator.requestTick()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(2))
+    expect(spy.mock.calls[1]![0].map((f) => f.start)).toEqual(
+      Array.from({ length: 10 }, (_, i) => (10 + i) * 10_000),
+    )
+
+    video.currentTime = 170
+    coordinator.requestTick()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(3))
+    expect(spy.mock.calls[2]![0]).toHaveLength(3)
+    coordinator.stop()
+  })
+
+  it("reads a changed batch size for the next group", async () => {
+    vi.mocked(getLocalConfig).mockResolvedValue(configWithBatchSize(10))
+    const { coordinator, spy, video } = await createSession()
+    coordinator.start()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+    vi.mocked(getLocalConfig).mockResolvedValue(configWithBatchSize(3))
+    video.currentTime = 70
+    coordinator.requestTick()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(2))
+    expect(spy.mock.calls[1]![0]).toHaveLength(3)
+    coordinator.stop()
+  })
+
+  it("keeps non-AI subtitles inside the old window regardless of the batch setting", async () => {
+    const config = configWithBatchSize(10)
+    config.videoSubtitles.providerId = "google-translate-default"
+    vi.mocked(getLocalConfig).mockResolvedValue(config)
+    const { coordinator, spy } = await createSession()
+    coordinator.start()
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+    expect(spy.mock.calls[0]![0]).toHaveLength(4)
+    coordinator.stop()
+  })
+
+  it("does not start a request after stopping during the config read", async () => {
+    let resolveConfig!: (value: typeof DEFAULT_CONFIG) => void
+    vi.mocked(getLocalConfig).mockReturnValue(
+      new Promise((resolve) => {
+        resolveConfig = resolve
+      }),
+    )
+    const { coordinator, spy } = await createSession()
+    coordinator.start()
+    coordinator.stop()
+    resolveConfig(configWithBatchSize(10))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(spy).not.toHaveBeenCalled()
   })
 })

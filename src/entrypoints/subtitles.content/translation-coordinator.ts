@@ -1,8 +1,11 @@
 import type { SegmentationPipeline } from "./segmentation-pipeline"
+import type { Config } from "@/types/config/config"
 import type { SubtitlesVideoContext } from "@/utils/subtitles/processor/translator"
 import type { SubtitlesFragment, SubtitlesState } from "@/utils/subtitles/types"
+import { isLLMProviderConfig } from "@/types/config/provider"
 import { getLocalConfig } from "@/utils/config/storage"
 import { TRANSLATE_LOOK_AHEAD_MS, TRANSLATION_BATCH_SIZE } from "@/utils/constants/subtitles"
+import { resolveProviderRefForCapability } from "@/utils/providers/provider-registry"
 import { effectiveLookAheadMs } from "@/utils/subtitles/lookahead"
 import { translateSubtitles } from "@/utils/subtitles/processor/translator"
 import { adPlayingAtom, subtitlesStore } from "./atoms"
@@ -188,40 +191,70 @@ export class TranslationCoordinator {
     void this.translateNearby(currentTimeMs)
   }
 
+  private isPendingFragment(fragment: SubtitlesFragment, currentTimeMs: number): boolean {
+    return (
+      !this.translatedStarts.has(fragment.start) &&
+      !this.translatingStarts.has(fragment.start) &&
+      !this.failedStarts.has(fragment.start) &&
+      fragment.start >= currentTimeMs - 5000
+    )
+  }
+
   private async translateNearby(currentTimeMs: number) {
     if (!this.active) return
-
-    const fragments = this.getFragments()
-
-    const lookAheadMs = effectiveLookAheadMs(
-      TRANSLATE_LOOK_AHEAD_MS,
-      this.getVideoElement()?.playbackRate,
+    // Do not read and parse stored settings on every timeupdate once the
+    // nearby captions are already translated.
+    const next = this.getFragments().find((f) => this.isPendingFragment(f, currentTimeMs))
+    if (
+      !next ||
+      next.start >
+        currentTimeMs +
+          effectiveLookAheadMs(TRANSLATE_LOOK_AHEAD_MS, this.getVideoElement()?.playbackRate)
     )
-
-    const batch = fragments
-      .filter(
-        (f) =>
-          !this.translatedStarts.has(f.start) &&
-          !this.translatingStarts.has(f.start) &&
-          !this.failedStarts.has(f.start) &&
-          f.start >= currentTimeMs - 5000 &&
-          f.start <= currentTimeMs + lookAheadMs,
-      )
-      .slice(0, TRANSLATION_BATCH_SIZE)
-
-    if (batch.length === 0) {
       return
-    }
 
     const runId = this.runId
     this.isTranslating = true
-    batch.forEach((f) => {
-      this.translatingStarts.add(f.start)
-      this.rememberIdentity(f)
-    })
+    let batch: SubtitlesFragment[] = []
+    let config: Config | null = null
 
     try {
-      const translated = await translateSubtitles(batch, this.videoContext)
+      config = await getLocalConfig()
+      if (!this.active || runId !== this.runId || subtitlesStore.get(adPlayingAtom)) return
+      currentTimeMs = this.getCurrentVideoTimeMs(currentTimeMs)
+      const fragments = this.getFragments()
+      const lookAheadMs = effectiveLookAheadMs(
+        TRANSLATE_LOOK_AHEAD_MS,
+        this.getVideoElement()?.playbackRate,
+      )
+      const provider =
+        config &&
+        resolveProviderRefForCapability(
+          "videoSubtitles",
+          config.providersConfig,
+          config.videoSubtitles.providerId,
+        )
+      const useBatch =
+        provider && (provider.kind === "system" || isLLMProviderConfig(provider.config))
+      const pending = fragments.filter((f) => this.isPendingFragment(f, currentTimeMs))
+      // The look-ahead window decides WHEN to fetch the next group. For AI,
+      // select a full group even when its later cues extend beyond that window.
+      if (!pending[0] || pending[0].start > currentTimeMs + lookAheadMs) return
+      batch = useBatch
+        ? pending.slice(
+            0,
+            Math.max(1, Math.floor(config!.videoSubtitles.batchQueueConfig.maxItemsPerBatch)),
+          )
+        : pending
+            .filter((f) => f.start <= currentTimeMs + lookAheadMs)
+            .slice(0, TRANSLATION_BATCH_SIZE)
+
+      batch.forEach((f) => {
+        this.translatingStarts.add(f.start)
+        this.rememberIdentity(f)
+      })
+
+      const translated = await translateSubtitles(batch, this.videoContext, config ?? undefined)
       if (!this.active || runId !== this.runId) {
         batch.forEach((f) => this.translatingStarts.delete(f.start))
         return
@@ -262,7 +295,7 @@ export class TranslationCoordinator {
         this.rememberIdentity(f)
       })
 
-      const config = await getLocalConfig()
+      if (!config) config = await getLocalConfig()
       if (!this.active || runId !== this.runId) {
         return
       }
@@ -285,7 +318,7 @@ export class TranslationCoordinator {
       // Only the current generation may clear the lock / chain another tick.
       if (runId === this.runId) {
         this.isTranslating = false
-        if (this.active) {
+        if (this.active && batch.length > 0) {
           this.handleTranslationTick()
         }
       }

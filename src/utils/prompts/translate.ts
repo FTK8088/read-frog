@@ -37,6 +37,8 @@ These mandatory rules override any conflicting instructions above:
 
 export interface TranslatePromptOptions<TContext = unknown> {
   isBatch?: boolean
+  /** Actual dispatched item count, after cache filtering, deduplication and size limits. */
+  batchSize?: number
   context?: TContext
   /**
    * Glossary entries the caller found in `input`. Only matched terms are ever

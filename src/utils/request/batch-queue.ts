@@ -127,6 +127,26 @@ export class BatchQueue<T, R> {
   }
 
   enqueue(data: T): Promise<R> {
+    return this.enqueueTask(data, this.getBatchKey(data))
+  }
+
+  /** Submit a preselected group without waiting for the collection timer.
+   * Groups stay separate while retaining size limits, deduplication and retries.
+   */
+  enqueueBatch(dataList: T[]): Promise<R>[] {
+    const groupId = getRandomUUID()
+    const keys = new Set<string>()
+    const promises = dataList.map((data) => {
+      const key = `${groupId}:${this.getBatchKey(data)}`
+      keys.add(key)
+      return this.enqueueTask(data, key)
+    })
+    for (const key of keys) this.flushPendingBatchByKey(key)
+    this.schedule()
+    return promises
+  }
+
+  private enqueueTask(data: T, batchKey: string): Promise<R> {
     const scope = this.getScope?.(data)
     const dedupKey = this.getDedupKey?.(data)
     if (dedupKey) {
@@ -157,7 +177,6 @@ export class BatchQueue<T, R> {
       reject = rej
     })
 
-    const batchKey = this.getBatchKey(data)
     const task: BatchTask<T, R> = {
       data,
       resolve,
