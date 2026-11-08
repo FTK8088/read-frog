@@ -15,6 +15,8 @@ export interface TranslationCoordinatorOptions {
   getVideoElement: () => HTMLVideoElement | null
   getCurrentState: () => SubtitlesState
   segmentationPipeline: SegmentationPipeline | null
+  /** A session's first translation waits for context, up to this fixed deadline. */
+  initialContext?: { ready: Promise<void>; deadline: number }
   onTranslated: (fragments: SubtitlesFragment[]) => void
   onStateChange: (state: SubtitlesState, data?: Record<string, string>) => void
 }
@@ -37,6 +39,9 @@ export class TranslationCoordinator {
   private lastEmittedState: SubtitlesState = "idle"
   private videoContext: SubtitlesVideoContext = { videoTitle: "", subtitlesTextContent: "" }
   private listenersAttached = false
+  private initialContextReady?: Promise<void>
+  private initialContextDeadline = 0
+  private initialContextTimer: ReturnType<typeof setTimeout> | null = null
 
   private getFragments: () => SubtitlesFragment[]
   private getVideoElement: () => HTMLVideoElement | null
@@ -52,6 +57,13 @@ export class TranslationCoordinator {
     this.segmentationPipeline = options.segmentationPipeline
     this.onTranslated = options.onTranslated
     this.onStateChange = options.onStateChange
+    if (options.initialContext) {
+      const { ready, deadline } = options.initialContext
+      this.initialContextReady = ready
+      this.initialContextDeadline = deadline
+      const release = () => this.finishInitialContextWait(ready)
+      void ready.then(release, release)
+    }
   }
 
   start(videoContext?: SubtitlesVideoContext) {
@@ -75,6 +87,8 @@ export class TranslationCoordinator {
   stop() {
     this.active = false
     this.runId += 1
+    // Keep the deadline on pause so resume cannot start another full wait.
+    this.clearInitialContextTimer()
     // Allow a subsequent start() to translate immediately; the in-flight batch is
     // invalidated by runId and must not leave locks stuck.
     this.isTranslating = false
@@ -92,6 +106,8 @@ export class TranslationCoordinator {
   reset() {
     this.active = false
     this.runId += 1
+    this.initialContextReady = undefined
+    this.clearInitialContextTimer()
     this.detachVideoListeners()
     this.translatingStarts.clear()
     this.translatedStarts.clear()
@@ -100,6 +116,38 @@ export class TranslationCoordinator {
     this.isTranslating = false
     this.lastEmittedState = "idle"
     this.videoContext = { videoTitle: "", subtitlesTextContent: "" }
+  }
+
+  private clearInitialContextTimer() {
+    if (this.initialContextTimer !== null) {
+      clearTimeout(this.initialContextTimer)
+      this.initialContextTimer = null
+    }
+  }
+
+  private finishInitialContextWait(ready: Promise<void>) {
+    // A late completion after timeout/reset must not kick another translation.
+    if (this.initialContextReady !== ready) return
+    this.initialContextReady = undefined
+    this.clearInitialContextTimer()
+    this.requestTick()
+  }
+
+  private isWaitingForInitialContext(): boolean {
+    const ready = this.initialContextReady
+    if (!ready) return false
+
+    const remainingMs = this.initialContextDeadline - Date.now()
+    if (remainingMs <= 0) {
+      this.initialContextReady = undefined
+      this.clearInitialContextTimer()
+      return false
+    }
+
+    if (this.initialContextTimer === null) {
+      this.initialContextTimer = setTimeout(() => this.finishInitialContextWait(ready), remainingMs)
+    }
+    return true
   }
 
   private attachVideoListeners(video: HTMLVideoElement) {
@@ -187,7 +235,7 @@ export class TranslationCoordinator {
       this.segmentationPipeline.restart()
     }
 
-    if (this.isTranslating) return
+    if (this.isWaitingForInitialContext() || this.isTranslating) return
     void this.translateNearby(currentTimeMs)
   }
 

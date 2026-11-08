@@ -13,6 +13,7 @@ export const MIN_STANDALONE_CUE_DURATION_MS = 1000
 
 // On-demand translation constants
 export const TRANSLATION_BATCH_SIZE = 5
+export const SUBTITLES_SUMMARY_WAIT_TIMEOUT_MS = 10_000
 export const TRANSLATE_LOOK_AHEAD_MS = 30_000
 export const PROCESS_LOOK_AHEAD_MS = 60_000
 export const MAX_LOOKAHEAD_RATE = 4

@@ -16,6 +16,7 @@ import {
   HIDE_NATIVE_CAPTIONS_STYLE_ID,
   NAVIGATION_HANDLER_DELAY,
   SUBTITLES_SOURCE,
+  SUBTITLES_SUMMARY_WAIT_TIMEOUT_MS,
   TRANSLATE_BUTTON_CONTAINER_ID,
 } from "@/utils/constants/subtitles"
 import { getSourceDocumentTitle } from "@/utils/content/document-title"
@@ -23,6 +24,7 @@ import { getDocumentDescription } from "@/utils/content/metadata"
 import { resolveLanguageCodeFromLocale } from "@/utils/content/page-language"
 import { waitForElement } from "@/utils/dom/wait-for-element"
 import { i18n } from "@/utils/i18n"
+import { logger } from "@/utils/logger"
 import { canProviderRefGenerateText } from "@/utils/providers/provider-ref"
 import { resolveProviderRefForCapability } from "@/utils/providers/provider-registry"
 import { removeReactShadowHost } from "@/utils/react-shadow-host/create-shadow-host"
@@ -1070,6 +1072,7 @@ export class UniversalVideoAdapter implements SubtitlesProvidersAdapter {
   private async processTranslatedSubtitles(config: Config | null) {
     const scheduler = this.subtitlesScheduler
     if (!scheduler) return
+    const operationId = this.switchOperationId
 
     const useAiSegmentation = !!config?.videoSubtitles?.aiSegmentation
 
@@ -1091,6 +1094,14 @@ export class UniversalVideoAdapter implements SubtitlesProvidersAdapter {
     // rule-based recut and skips the summary without a doomed prompt attempt
     // per look-ahead window.
     const providerRef = config ? await resolveSubtitlesProviderRef(config, "lineTranslation") : null
+    if (
+      this.destroyed ||
+      this.switchOperationId !== operationId ||
+      this.subtitlesScheduler !== scheduler ||
+      !scheduler.isActive()
+    ) {
+      return
+    }
     const promptableProviderRef =
       providerRef && canProviderRefGenerateText(providerRef) ? providerRef : null
 
@@ -1124,7 +1135,37 @@ export class UniversalVideoAdapter implements SubtitlesProvidersAdapter {
       })
     }
 
-    this.translationCoordinator = new TranslationCoordinator({
+    // Start the summary before translation; its deadline includes background queue time.
+    const summaryContextHash = buildSubtitlesSummaryContextHash(
+      videoContext,
+      promptableProviderRef ?? undefined,
+    )
+    this.subtitlesSummaryContextHash = summaryContextHash ?? null
+    const shouldFetchSummary =
+      config?.pageTranslation?.enableAIContentAware &&
+      promptableProviderRef &&
+      videoContext.videoTitle &&
+      videoContext.subtitlesTextContent &&
+      summaryContextHash
+    const summaryDeadline = Date.now() + SUBTITLES_SUMMARY_WAIT_TIMEOUT_MS
+    const summaryReady = shouldFetchSummary
+      ? fetchSubtitlesSummary(videoContext, config, promptableProviderRef).then(
+          (summary) => {
+            if (
+              !this.destroyed &&
+              this.translationCoordinator === coordinator &&
+              this.subtitlesSummaryContextHash === summaryContextHash
+            ) {
+              videoContext.summary = summary
+            }
+          },
+          (error: unknown) => {
+            logger.warn("[Subtitles] Failed to fetch translation context summary", error)
+          },
+        )
+      : undefined
+
+    const coordinator = new TranslationCoordinator({
       getFragments: () =>
         this.segmentationPipeline
           ? this.segmentationPipeline.processedFragments
@@ -1132,30 +1173,11 @@ export class UniversalVideoAdapter implements SubtitlesProvidersAdapter {
       getVideoElement: () => scheduler.getVideoElement(),
       getCurrentState: () => scheduler.getState(),
       segmentationPipeline: this.segmentationPipeline,
+      initialContext: summaryReady ? { ready: summaryReady, deadline: summaryDeadline } : undefined,
       onTranslated: (fragments) => scheduler.supplementSubtitles(fragments),
       onStateChange: (state, data) => scheduler.setState(state, data),
     })
-    this.translationCoordinator.start(videoContext)
-    // The hash and the summary must share one ref — the promptable one — or
-    // the cache identity and the ref that rides the message could diverge.
-    const summaryContextHash = buildSubtitlesSummaryContextHash(
-      videoContext,
-      promptableProviderRef ?? undefined,
-    )
-    this.subtitlesSummaryContextHash = summaryContextHash ?? null
-
-    void fetchSubtitlesSummary(videoContext, config ?? undefined, promptableProviderRef).then(
-      (summary) => {
-        if (!summaryContextHash) {
-          return
-        }
-
-        if (this.subtitlesSummaryContextHash !== summaryContextHash) {
-          return
-        }
-
-        videoContext.summary = summary
-      },
-    )
+    this.translationCoordinator = coordinator
+    coordinator.start(videoContext)
   }
 }

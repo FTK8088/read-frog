@@ -1,4 +1,7 @@
+import type { SubtitlesVideoContext } from "@/utils/subtitles/processor/translator"
+import type { SubtitlesFragment } from "@/utils/subtitles/types"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { DEFAULT_CONFIG } from "@/utils/constants/config"
 import { SUBTITLES_SOURCE } from "@/utils/constants/subtitles"
 import {
   NoSubtitlesError,
@@ -117,6 +120,156 @@ describe("universalVideoAdapter", () => {
   afterEach(() => {
     subtitlesStore.set(adPlayingAtom, false)
     vi.unstubAllGlobals()
+  })
+
+  describe("initial translation context", () => {
+    let adapter: UniversalVideoAdapter
+    let resolveSummary: (value: string | null) => void
+    let rejectSummary: (error: Error) => void
+    let contexts: SubtitlesVideoContext[]
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      contexts = []
+      mocks.buildSubtitlesSummaryContextHash.mockReturnValue("same-context-hash")
+      mocks.fetchSubtitlesSummary.mockReturnValue(
+        new Promise<string | null>((resolve, reject) => {
+          resolveSummary = resolve
+          rejectSummary = reject
+        }),
+      )
+      mocks.translateSubtitles.mockImplementation(
+        async (fragments: SubtitlesFragment[], context: SubtitlesVideoContext) => {
+          // Snapshot at dispatch: a late summary mutates the shared video context.
+          contexts.push({ ...context })
+          return fragments.map((f) => ({ ...f, translation: `t:${f.text}` }))
+        },
+      )
+    })
+
+    afterEach(() => {
+      ;(adapter as any)?.translationCoordinator?.stop()
+      mocks.buildSubtitlesSummaryContextHash.mockReturnValue(null)
+      mocks.fetchSubtitlesSummary.mockResolvedValue(undefined)
+      mocks.resolveSubtitlesProviderRef.mockResolvedValue(undefined)
+      mocks.translateSubtitles.mockReset()
+      vi.useRealTimers()
+    })
+
+    async function startSession(providerId = "openai-default", enableAIContentAware = true) {
+      const config = {
+        ...DEFAULT_CONFIG,
+        pageTranslation: { ...DEFAULT_CONFIG.pageTranslation, enableAIContentAware },
+        videoSubtitles: {
+          ...DEFAULT_CONFIG.videoSubtitles,
+          providerId,
+          aiSegmentation: false,
+          batchQueueConfig: { maxCharactersPerBatch: 1000, maxItemsPerBatch: 10 },
+        },
+      }
+      mocks.getLocalConfig.mockResolvedValue(config)
+      mocks.resolveSubtitlesProviderRef.mockResolvedValue({
+        kind: "local",
+        config: config.providersConfig.find((p) => p.id === providerId),
+      })
+      const fragments = Array.from({ length: 20 }, (_, i) => ({
+        text: `Line ${i}.`,
+        start: i * 10_000,
+        end: i * 10_000 + 5000,
+      }))
+      ;({ adapter } = createAdapter(fragments))
+      const scheduler = attachScheduler(adapter, true)
+      const video = Object.assign(new EventTarget(), { currentTime: 0, playbackRate: 1 })
+      scheduler.getVideoElement.mockReturnValue(video)
+      ;(adapter as any).sourceProcessedSubtitles = fragments
+      ;(adapter as any).sessionSubtitles = fragments
+      await (adapter as any).processTranslatedSubtitles(config)
+      await vi.advanceTimersByTimeAsync(0)
+      return { config, fragments, video, scheduler }
+    }
+
+    it("waits for the summary and includes it in the first configured batch", async () => {
+      await startSession()
+      await vi.advanceTimersByTimeAsync(9000)
+      expect(mocks.fetchSubtitlesSummary).toHaveBeenCalledTimes(1)
+      expect(mocks.translateSubtitles).not.toHaveBeenCalled()
+
+      resolveSummary("Video context")
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(mocks.translateSubtitles).toHaveBeenCalledTimes(1)
+      expect(mocks.translateSubtitles.mock.calls[0]![0]).toHaveLength(10)
+      expect(contexts[0]!.summary).toBe("Video context")
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("releases at 10 seconds and uses a late summary only for later batches", async () => {
+      const { video } = await startSession()
+      await vi.advanceTimersByTimeAsync(9999)
+      expect(mocks.translateSubtitles).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(mocks.translateSubtitles).toHaveBeenCalledTimes(1)
+      expect(contexts[0]!.summary).toBeUndefined()
+
+      resolveSummary("Late context")
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mocks.translateSubtitles).toHaveBeenCalledTimes(1)
+
+      video.currentTime = 70
+      video.dispatchEvent(new Event("timeupdate"))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mocks.translateSubtitles).toHaveBeenCalledTimes(2)
+      expect(contexts[1]!.summary).toBe("Late context")
+      expect(mocks.fetchSubtitlesSummary).toHaveBeenCalledTimes(1)
+    })
+
+    it.each(["empty", "rejected"])(
+      "continues immediately when the summary is %s",
+      async (result) => {
+        await startSession()
+        if (result === "empty") resolveSummary(null)
+        else rejectSummary(new Error("Summary unavailable"))
+        await vi.advanceTimersByTimeAsync(0)
+
+        expect(mocks.translateSubtitles).toHaveBeenCalledTimes(1)
+        expect(contexts[0]!.summary ?? null).toBeNull()
+        expect(vi.getTimerCount()).toBe(0)
+      },
+    )
+
+    it.each([
+      ["openai-default", false],
+      ["google-translate-default", true],
+    ])("does not wait for provider %s with content awareness %s", async (providerId, enabled) => {
+      await startSession(providerId, enabled)
+      expect(mocks.fetchSubtitlesSummary).not.toHaveBeenCalled()
+      expect(mocks.translateSubtitles).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("ignores an old session's summary even when the context hash is unchanged", async () => {
+      const { config, fragments } = await startSession()
+      const oldContext = mocks.fetchSubtitlesSummary.mock.calls[0]![0] as SubtitlesVideoContext
+      const resolveOldSummary = resolveSummary
+      ;(adapter as any).clearRuntimeSession()
+      ;(adapter as any).sessionSubtitles = fragments
+      mocks.fetchSubtitlesSummary.mockReturnValueOnce(
+        new Promise<string | null>((resolve) => {
+          resolveSummary = resolve
+        }),
+      )
+      await (adapter as any).processTranslatedSubtitles(config)
+
+      resolveOldSummary("Old context")
+      await vi.advanceTimersByTimeAsync(0)
+      expect(oldContext.summary).toBeUndefined()
+      expect(mocks.translateSubtitles).not.toHaveBeenCalled()
+
+      resolveSummary("New context")
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mocks.translateSubtitles).toHaveBeenCalledTimes(1)
+      expect(contexts[0]!.summary).toBe("New context")
+    })
   })
 
   it("tracks ad state and resyncs subtitles when an ad ends", () => {

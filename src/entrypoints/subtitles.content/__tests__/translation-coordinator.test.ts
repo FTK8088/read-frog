@@ -2,6 +2,7 @@ import type { Config } from "@/types/config/config"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { getLocalConfig } from "@/utils/config/storage"
 import { DEFAULT_CONFIG } from "@/utils/constants/config"
+import { SUBTITLES_SUMMARY_WAIT_TIMEOUT_MS } from "@/utils/constants/subtitles"
 import { TranslationCoordinator } from "../translation-coordinator"
 
 vi.mock("@/utils/config/storage", () => ({
@@ -12,6 +13,105 @@ beforeEach(() => {
   vi.mocked(getLocalConfig).mockResolvedValue(null)
 })
 afterEach(() => vi.restoreAllMocks())
+
+describe("initial subtitle context deadline", () => {
+  let coordinator: TranslationCoordinator
+
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => {
+    coordinator?.stop()
+    vi.useRealTimers()
+  })
+
+  async function createWaitingSession() {
+    const translator = await import("@/utils/subtitles/processor/translator")
+    const spy = vi
+      .spyOn(translator, "translateSubtitles")
+      .mockImplementation(async (fragments) =>
+        fragments.map((f) => ({ ...f, translation: `t:${f.text}` })),
+      )
+    let release!: () => void
+    const ready = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const video = Object.assign(new EventTarget(), { currentTime: 0, playbackRate: 1 })
+    const onTranslated = vi.fn<(...args: any[]) => any>()
+    coordinator = new TranslationCoordinator({
+      getFragments: () => [
+        { text: "start", start: 0, end: 1000 },
+        { text: "later", start: 70_000, end: 71_000 },
+      ],
+      getVideoElement: () => video as HTMLVideoElement,
+      getCurrentState: () => "idle",
+      segmentationPipeline: null,
+      initialContext: { ready, deadline: Date.now() + SUBTITLES_SUMMARY_WAIT_TIMEOUT_MS },
+      onTranslated,
+      onStateChange: vi.fn<(...args: any[]) => any>(),
+    })
+    coordinator.start()
+    return { spy, video, release, onTranslated }
+  }
+
+  it("keeps the original deadline across stop and resume", async () => {
+    const { spy } = await createWaitingSession()
+    await vi.advanceTimersByTimeAsync(3000)
+    coordinator.stop()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(5000)
+    coordinator.start()
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(spy).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not wait again when resumed after the deadline", async () => {
+    const { spy } = await createWaitingSession()
+    coordinator.stop()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(spy).not.toHaveBeenCalled()
+    coordinator.start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not restart translation when context arrives after stopping", async () => {
+    const { spy, release, onTranslated } = await createWaitingSession()
+    coordinator.stop()
+    release()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(spy).not.toHaveBeenCalled()
+    expect(onTranslated).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+
+    coordinator.start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not restart a reset session on context completion or timeout", async () => {
+    const { spy, release } = await createWaitingSession()
+    coordinator.reset()
+    release()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(spy).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("blocks every trigger while waiting and selects cues at the latest playback position", async () => {
+    const { spy, video } = await createWaitingSession()
+    video.currentTime = 70
+    video.dispatchEvent(new Event("timeupdate"))
+    video.dispatchEvent(new Event("seeked"))
+    coordinator.requestTick()
+    coordinator.noteFragmentListChanged()
+    await vi.advanceTimersByTimeAsync(9999)
+    expect(spy).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect(spy.mock.calls[0]![0].map((f) => f.text)).toEqual(["later"])
+  })
+})
 
 describe("translation coordinator loading state", () => {
   it("sets loading for the active untranslated cue", () => {
